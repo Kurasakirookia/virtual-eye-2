@@ -1,0 +1,18 @@
+# python
+.venv/
+__pycache__/
+*.pyc
+
+# editors
+.vscode/
+.idea/
+
+# ultralytics / runs
+runs/
+
+# os
+.DS_Store
+Thumbs.db
+
+# models/artifacts (optional)
+*.pt
