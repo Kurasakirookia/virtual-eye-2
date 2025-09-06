@@ -1,4 +1,3 @@
-# app/virtual_eye_phase4.py
 import cv2
 import time
 from collections import defaultdict
@@ -66,6 +65,49 @@ def load_known_faces(folder_path="known_faces"):
             print(f" - Error loading {os.path.basename(image_path)}: {e}")
     return known_face_encodings, known_face_names
 
+def safe_face_encodings(face_image):
+    """
+    Safely extract face encodings with proper error handling and format validation
+    """
+    try:
+        # Check if image is valid
+        if face_image is None or face_image.size == 0:
+            return []
+        
+        # Check minimum dimensions
+        if face_image.shape[0] < 10 or face_image.shape[1] < 10:
+            return []
+        
+        # Ensure image is contiguous in memory
+        if not face_image.flags['C_CONTIGUOUS']:
+            face_image = np.ascontiguousarray(face_image)
+        
+        # Ensure correct data type
+        if face_image.dtype != np.uint8:
+            face_image = face_image.astype(np.uint8)
+        
+        # The face_image from cv2 crop is already in RGB format since we converted the frame earlier
+        # First, try to detect face locations in the cropped image
+        face_locations = face_recognition.face_locations(face_image, model="hog")
+        
+        if face_locations:
+            # If faces are found, get encodings
+            face_encodings = face_recognition.face_encodings(
+                face_image, 
+                known_face_locations=face_locations,
+                num_jitters=1
+            )
+            return face_encodings
+        else:
+            # If no faces detected in crop, try with the whole image anyway
+            # Sometimes the crop might cut off parts of the face
+            face_encodings = face_recognition.face_encodings(face_image, num_jitters=1)
+            return face_encodings
+            
+    except Exception as e:
+        print(f"Error in face encoding: {e}")
+        return []
+
 def describe_scene_with_ai(scene_data):
     """ Takes structured scene data and uses an LLM to generate a human-like description. """
     if not llm_model:
@@ -74,7 +116,7 @@ def describe_scene_with_ai(scene_data):
         return "The scene appears to be clear."
     
     # Construct a detailed prompt for the AI
-    prompt = "You are an AI assistant for a visually impaired person. Your task is to describe the scene in a clear, concise, and natural way. Do not use robotic language. Be descriptive and helpful. Here is the data from the camera:\n\n"
+    prompt = "You are an AI assistant for a visually impaired person. Your task is to describe the scene in a clear, concise, and natural way. Do not use robotic language.Do not say any extra information that you can't explain.Do not overwhlem the user. Be descriptive and helpful. Here is the data from the camera:\n\n"
     
     object_descriptions = []
     for obj in scene_data["objects"]:
@@ -172,7 +214,8 @@ def main():
             current_confirmed_objects = []
             if hasattr(results[0].boxes, "cls"):
                 all_boxes = results[0].boxes
-                rgb_small_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                # Convert to RGB once for face recognition
+                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
                 for i in range(len(all_boxes.cls)):
                     label = model.names[int(all_boxes.cls[i])]
@@ -180,16 +223,15 @@ def main():
                     x1, y1, x2, y2 = map(int, box)
                     
                     if label == "person" and known_face_names:
-                        face_image = rgb_small_frame[y1:y2, x1:x2]
+                        # Crop the face region from RGB frame
+                        face_image = rgb_frame[y1:y2, x1:x2]
                         
-                        # --- THE FIX IS HERE ---
-                        # Directly compute encodings from the cropped face image.
-                        # This removes the unnecessary and error-prone second call to find face locations.
-                        face_encodings = face_recognition.face_encodings(face_image)
+                        # --- FIXED FACE ENCODING WITH PROPER ERROR HANDLING ---
+                        face_encodings = safe_face_encodings(face_image)
                         
                         if face_encodings:
-                            # Use the first encoding found in the crop
-                            matches = face_recognition.compare_faces(known_face_encodings, face_encodings[0])
+                            # Use the first encoding found
+                            matches = face_recognition.compare_faces(known_face_encodings, face_encodings[0], tolerance=0.6)
                             name = "an unknown person"
                             if True in matches:
                                 first_match_index = matches.index(True)
@@ -241,4 +283,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
