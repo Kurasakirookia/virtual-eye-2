@@ -1,5 +1,8 @@
 ultralytics
 opencv-python
-numpy
-pyttsx3
-torch
+face_recognition
+google-generativeai
+edge-tts
+python-dotenv
+pydub
+simpleaudio

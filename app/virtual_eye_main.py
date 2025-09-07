@@ -1,3 +1,4 @@
+# app/virtual_eye_phase4.py
 import cv2
 import time
 from collections import defaultdict
@@ -7,12 +8,15 @@ import os
 import glob
 import numpy as np
 import asyncio
+import io
 
 # --- NEW IMPORTS FOR PHASE 4 ---
 import face_recognition
-import google.generativeai as genai # <-- CORRECTED TYPO HERE
+import google.generativeai as genai
 import edge_tts
-from dotenv import load_dotenv # <-- ADDED FOR .env SUPPORT
+from dotenv import load_dotenv
+from pydub import AudioSegment
+from pydub.playback import _play_with_simpleaudio as play
 
 # --- CONFIGURATION & TUNING ---
 PRIORITY = {
@@ -20,11 +24,12 @@ PRIORITY = {
     "dog": 3, "cat": 3, "chair": 2, "table": 2, "phone": 1, "bottle": 1,
 }
 PERSIST_FRAMES = 3
-AI_NARRATION_INTERVAL = 6 # Seconds between calling the AI for a new description
-TOP_K = 5 # Let the AI decide from a wider range of objects
+AI_NARRATION_INTERVAL = 5 # Seconds before re-evaluating a static scene
+MIN_NARRATION_GAP = 0 # Minimum seconds between any two narrations to avoid spamming API
+TOP_K = 5 
 
 # --- AI & TTS SETUP ---
-load_dotenv() # <-- ADDED TO LOAD YOUR .env FILE
+load_dotenv()
 try:
     GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
     if not GOOGLE_API_KEY:
@@ -36,8 +41,9 @@ except Exception as e:
     print(f"FATAL ERROR: Could not configure Gemini AI. Error: {e}")
     llm_model = None
 
-VOICE = "en-US-JennyNeural" # A natural-sounding voice
+VOICE = "en-US-JennyNeural"
 speech_queue = queue.Queue()
+playback_handle = None # Global handle for audio playback, to allow interruption
 
 # --- UTILITY & SETUP FUNCTIONS ---
 def load_known_faces(folder_path="known_faces"):
@@ -59,77 +65,18 @@ def load_known_faces(folder_path="known_faces"):
                 known_face_encodings.append(face_encodings[0])
                 known_face_names.append(name)
                 print(f" - Learned face: {name}")
-            else:
-                print(f" - Warning: No face found in {os.path.basename(image_path)}")
         except Exception as e:
             print(f" - Error loading {os.path.basename(image_path)}: {e}")
     return known_face_encodings, known_face_names
 
-def safe_face_encodings(face_image):
-    """
-    Safely extract face encodings with proper error handling and format validation
-    """
-    try:
-        # Check if image is valid
-        if face_image is None or face_image.size == 0:
-            return []
-        
-        # Check minimum dimensions
-        if face_image.shape[0] < 10 or face_image.shape[1] < 10:
-            return []
-        
-        # Ensure image is contiguous in memory
-        if not face_image.flags['C_CONTIGUOUS']:
-            face_image = np.ascontiguousarray(face_image)
-        
-        # Ensure correct data type
-        if face_image.dtype != np.uint8:
-            face_image = face_image.astype(np.uint8)
-        
-        # The face_image from cv2 crop is already in RGB format since we converted the frame earlier
-        # First, try to detect face locations in the cropped image
-        face_locations = face_recognition.face_locations(face_image, model="hog")
-        
-        if face_locations:
-            # If faces are found, get encodings
-            face_encodings = face_recognition.face_encodings(
-                face_image, 
-                known_face_locations=face_locations,
-                num_jitters=1
-            )
-            return face_encodings
-        else:
-            # If no faces detected in crop, try with the whole image anyway
-            # Sometimes the crop might cut off parts of the face
-            face_encodings = face_recognition.face_encodings(face_image, num_jitters=1)
-            return face_encodings
-            
-    except Exception as e:
-        print(f"Error in face encoding: {e}")
-        return []
-
 def describe_scene_with_ai(scene_data):
     """ Takes structured scene data and uses an LLM to generate a human-like description. """
-    if not llm_model:
-        return "AI model is not available."
-    if not scene_data["objects"]:
-        return "The scene appears to be clear."
+    if not llm_model: return "AI model is not available."
+    if not scene_data["objects"]: return "The scene appears to be clear."
     
-    # Construct a detailed prompt for the AI
-    prompt = "You are an AI assistant for a visually impaired person. Your task is to describe the scene in a clear, concise, and natural way. Do not use robotic language.Do not say any extra information that you can't explain.Do not overwhlem the user. Be descriptive and helpful. Here is the data from the camera:\n\n"
-    
-    object_descriptions = []
-    for obj in scene_data["objects"]:
-        label = obj['label']
-        position = obj['position']
-        # Handle plural vs singular for the prompt
-        if obj.get('count', 1) > 1:
-            object_descriptions.append(f"{obj['count']} {label}s are {position}")
-        else:
-            object_descriptions.append(f"{label} is {position}")
-            
-    prompt += ", ".join(object_descriptions) + "."
-    prompt += "\n\nDescribe this scene."
+    prompt = "You are an AI assistant for a visually impaired person. Your task is to describe the scene in a clear, concise, and natural way. Do not use robotic language. Be descriptive and helpful. Here is the data from the camera:\n\n"
+    object_descriptions = [f"{obj.get('count', 1)} {obj['label']}s are {obj['position']}" if obj.get('count', 1) > 1 else f"{obj['label']} is {obj['position']}" for obj in scene_data["objects"]]
+    prompt += ", ".join(object_descriptions) + ".\n\nDescribe this scene in a single, fluid sentence."
 
     try:
         response = llm_model.generate_content(prompt)
@@ -138,34 +85,43 @@ def describe_scene_with_ai(scene_data):
         print(f"Error calling Gemini AI: {e}")
         return "There was an error describing the scene."
 
-async def amain_tts(text_to_speak) -> None:
-    """ Asynchronously communicates with Edge TTS to generate and play audio. """
+async def amain_tts_to_buffer(text_to_speak) -> io.BytesIO:
+    """ Asynchronously gets TTS audio and returns it in an in-memory buffer. """
+    buffer = io.BytesIO()
     communicate = edge_tts.Communicate(text_to_speak, VOICE)
-    # This is a placeholder for playing audio. In a real app, you'd save to a file
-    # and play it with a library like `playsound` or `pygame`. For simplicity,
-    # we'll just show it's working without actual audio output in this script.
-    async for _ in communicate.stream():
-        pass # This simulates the generation process
+    async for chunk in communicate.stream():
+        if chunk["type"] == "audio":
+            buffer.write(chunk["data"])
+    buffer.seek(0)
+    return buffer
 
 def speech_worker():
-    """ The speech thread that handles playing the generated audio. """
+    """ The speech thread that handles generating and playing audio from memory. """
+    global playback_handle
     while True:
         text = speech_queue.get()
         if text is None: break
+        
         print(f"AI Narrator: \"{text}\"")
         try:
-            asyncio.run(amain_tts(text))
+            if playback_handle and playback_handle.is_playing():
+                playback_handle.stop()
+            audio_buffer = asyncio.run(amain_tts_to_buffer(text))
+            audio_segment = AudioSegment.from_mp3(audio_buffer)
+            playback_handle = play(audio_segment)
         except Exception as e:
-            print(f"Error during TTS generation: {e}")
+            print(f"Error during TTS generation or playback: {e}")
         speech_queue.task_done()
 
 def speak(text):
+    """ Puts a new sentence in the queue, clearing any old ones first. """
     while not speech_queue.empty():
         try: speech_queue.get_nowait()
         except queue.Empty: continue
     speech_queue.put(text)
 
 def get_object_position(center_x, frame_width):
+    """ Divides the frame into three vertical zones: left, center, right. """
     zone_boundary_1 = frame_width / 3
     zone_boundary_2 = 2 * frame_width / 3
     if center_x < zone_boundary_1: return "on your left"
@@ -176,7 +132,7 @@ def get_object_position(center_x, frame_width):
 def main():
     from ultralytics import YOLO 
     
-    print("Starting Virtual Eye (Phase 4: AI Integration)...")
+    print("Starting Virtual Eye (Streaming Audio)...")
     known_face_encodings, known_face_names = load_known_faces()
     
     speech_thread = threading.Thread(target=speech_worker, daemon=True)
@@ -194,6 +150,7 @@ def main():
     # --- STATE TRACKING ---
     last_confirmed_set = set()
     last_ai_narration_time = 0
+    last_spoken_narration = ""
     frame_skip_counter = 0
     annotated_frame = None
 
@@ -203,55 +160,70 @@ def main():
         if not ret: break
         
         frame_height, frame_width, _ = frame.shape
-        
-        is_processing_frame = frame_skip_counter % 3 == 0
+        is_processing_frame = frame_skip_counter % 2 == 0 # Process every 2nd frame to increase responsiveness
         frame_skip_counter += 1
 
         if is_processing_frame:
-            results = model.predict(frame, conf=0.45, verbose=False)
+            results = model.predict(frame, conf=0.45, verbose=False, classes=[0, 2, 5, 7, 24, 26, 28, 39, 41, 63, 64, 67]) # Focus on relevant classes
             annotated_frame = results[0].plot()
 
             current_confirmed_objects = []
+            
+            # --- NEW, STABLE FACE RECOGNITION LOGIC ---
+            # 1. Find all faces in the current frame first.
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            face_locations = face_recognition.face_locations(rgb_frame)
+            face_encodings = face_recognition.face_encodings(rgb_frame, face_locations)
+            
+            face_names = []
+            for face_encoding in face_encodings:
+                matches = face_recognition.compare_faces(known_face_encodings, face_encoding)
+                name = "an unknown person"
+                if True in matches:
+                    first_match_index = matches.index(True)
+                    name = known_face_names[first_match_index]
+                face_names.append(name)
+            
+            # Process YOLO results
             if hasattr(results[0].boxes, "cls"):
                 all_boxes = results[0].boxes
-                # Convert to RGB once for face recognition
-                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
                 for i in range(len(all_boxes.cls)):
                     label = model.names[int(all_boxes.cls[i])]
                     box = all_boxes.xyxy[i]
                     x1, y1, x2, y2 = map(int, box)
                     
-                    if label == "person" and known_face_names:
-                        # Crop the face region from RGB frame
-                        face_image = rgb_frame[y1:y2, x1:x2]
+                    if label == "person":
+                        # 2. Match YOLO person box with a found face
+                        person_center_x = (x1 + x2) / 2
+                        person_center_y = (y1 + y2) / 2
                         
-                        # --- FIXED FACE ENCODING WITH PROPER ERROR HANDLING ---
-                        face_encodings = safe_face_encodings(face_image)
-                        
-                        if face_encodings:
-                            # Use the first encoding found
-                            matches = face_recognition.compare_faces(known_face_encodings, face_encodings[0], tolerance=0.6)
-                            name = "an unknown person"
-                            if True in matches:
-                                first_match_index = matches.index(True)
-                                name = known_face_names[first_match_index]
-                            label = name
-
+                        found_match = False
+                        for j, face_loc in enumerate(face_locations):
+                            top, right, bottom, left = face_loc
+                            # Check if the center of the YOLO person box is inside the face location
+                            if left < person_center_x < right and top < person_center_y < bottom:
+                                label = face_names[j] # Assign the recognized name
+                                found_match = True
+                                break
+                        if not found_match and face_names:
+                            # If no direct match, could be an unrecognized face
+                            label = "an unknown person"
+                    
                     center_x = (x1 + x2) / 2
                     position = get_object_position(center_x, frame_width)
                     current_confirmed_objects.append({'label': label, 'position': position})
 
             current_confirmed_set = set(obj['label'] for obj in current_confirmed_objects)
-
             time_since_last_narration = time.time() - last_ai_narration_time
-            should_narrate = False
-            if current_confirmed_set != last_confirmed_set and time_since_last_narration > 3:
-                should_narrate = True
+            
+            should_call_ai = False
+            # --- NEW COOLDOWN LOGIC TO PREVENT API SPAM ---
+            if current_confirmed_set != last_confirmed_set and time_since_last_narration > MIN_NARRATION_GAP:
+                should_call_ai = True
             elif time_since_last_narration > AI_NARRATION_INTERVAL and current_confirmed_set:
-                should_narrate = True
+                should_call_ai = True
 
-            if should_narrate:
+            if should_call_ai:
                 object_counts = defaultdict(list)
                 for obj in current_confirmed_objects:
                     object_counts[obj['label']].append(obj['position'])
@@ -264,7 +236,10 @@ def main():
                 scene_data = {"objects": final_scene_objects[:TOP_K]}
 
                 narration = describe_scene_with_ai(scene_data)
-                speak(narration)
+                
+                if narration and narration != last_spoken_narration and "error" not in narration.lower():
+                    speak(narration)
+                    last_spoken_narration = narration
 
                 last_confirmed_set = current_confirmed_set
                 last_ai_narration_time = time.time()
@@ -283,3 +258,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
