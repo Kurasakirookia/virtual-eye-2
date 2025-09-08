@@ -6,3 +6,4 @@ edge-tts
 python-dotenv
 pydub
 simpleaudio
+mediapipe
