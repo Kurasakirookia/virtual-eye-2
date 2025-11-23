@@ -1,0 +1,23 @@
+ultralytics
+opencv-python
+face_recognition
+google-generativeai
+# edge-tts
+python-dotenv
+# pydub
+# simpleaudio
+mediapipe
+timm
+# Optional (required for MiDaS depth estimation): install a matching torch + torchvision build for your system
+# Example (CPU): pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+torch
+torchvision
+protobuf==3.20.3
+pvporcupine
+speechrecognition
+pyaudio
+googlemaps
+geopy
+pyttsx3
+Flask
+flask-cors
