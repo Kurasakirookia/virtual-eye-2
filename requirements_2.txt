@@ -21,3 +21,5 @@ geopy
 pyttsx3
 Flask
 flask-cors
+geopy
+requests

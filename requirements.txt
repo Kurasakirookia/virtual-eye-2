@@ -19,3 +19,5 @@ pyaudio
 googlemaps
 geopy
 pyttsx3
+geopy
+requests
